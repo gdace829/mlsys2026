@@ -1,78 +1,67 @@
 import torch
+import math
 
 def sparse_attention_kernel(
-    q_c,               # [1, 16, 512]
-    q_r,               # [1, 16, 64]
-    kv_c_pool,         # [8462, 64, 512]
-    kv_r_pool,         # [8462, 64, 64]
-    kv_indices,        # [1, 2048]
+    q_c,               # q_nope: [num_tokens, 16, 512]
+    q_r,               # q_pe: [num_tokens, 16, 64]
+    kv_c_pool,         # ckv_cache: [num_pages, 64, 512]
+    kv_r_pool,         # kpe_cache: [num_pages, 64, 64]
+    kv_indices,        # sparse_indices: [num_tokens, 2048]
     sm_scale,          # float
-    out_tensor,        # [1, 16, 512]
-    lse_tensor         # [1, 16]
+    out_tensor,        # output: [num_tokens, 16, 512]
+    lse_tensor         # lse: [num_tokens, 16]
 ):
     """
-    MLA 逻辑对齐版：
-    1. 确保 QcKc 和 QrKr 严格按照 MLA 论文对齐。
-    2. 增强 LSE 的计算稳定性。
+    Correct implementation matching the reference from definition file.
+    Handles variable num_tokens, -1 padding in indices, and uses base-2 log for LSE.
     """
-    try:
-        device = q_c.device
-        # 强制使用 float32 进行中间计算以消除累积误差
-        qc = q_c.view(16, 512).to(torch.float32)
-        qr = q_r.view(16, 64).to(torch.float32)
-        
-        indices = kv_indices[0].to(torch.int64)
-        
-        # 结果累加器
-        acc_v = torch.zeros((16, 512), device=device, dtype=torch.float32)
-        # 使用极小值初始化
-        max_score = torch.full((16, 1), -1e10, device=device, dtype=torch.float32)
-        sum_exp = torch.zeros((16, 1), device=device, dtype=torch.float32)
+    device = q_c.device
+    num_tokens, num_qo_heads, head_dim_ckv = q_c.shape
+    head_dim_kpe = q_r.shape[-1]
+    num_pages, page_size, _ = kv_c_pool.shape
+    topk = kv_indices.shape[-1]
 
-        # 逐页处理 (确保 H100 稳定性)
-        for idx in indices:
-            # 这里的 index 可能需要 .item() 转换
-            curr_idx = idx.item()
-            kc = kv_c_pool[curr_idx].to(torch.float32) # [64, 512]
-            kr = kv_r_pool[curr_idx].to(torch.float32) # [64, 64]
-            
-            # --- 核心逻辑：MLA 拼接点积 ---
-            # 标准 MLA 点积: (Q_content @ K_content^T + Q_rope @ K_rope^T) * scale
-            # 注意: 这里假设每个 head 共享 KV content，但有独立的 QR
-            dot_c = torch.matmul(qc, kc.t()) # [16, 64]
-            dot_r = torch.matmul(qr, kr.t()) # [16, 64]
-            
-            logits = (dot_c + dot_r) * sm_scale
-            
-            # --- 数值稳定 Online Softmax ---
-            batch_max = torch.max(logits, dim=-1, keepdim=True)[0]
-            new_max = torch.max(max_score, batch_max)
-            
-            # 缩放因子
-            alpha = torch.exp(max_score - new_max)
-            p = torch.exp(logits - new_max)
-            
-            # 更新加权和
-            sum_exp = sum_exp * alpha + p.sum(dim=-1, keepdim=True)
-            acc_v = acc_v * alpha + torch.matmul(p, kc)
-            
-            max_score = new_max
+    # Verify constants (should match definition)
+    assert num_qo_heads == 16
+    assert head_dim_ckv == 512
+    assert head_dim_kpe == 64
+    assert page_size == 64
+    assert topk == 2048
 
-        # 归一化
-        res = acc_v / (sum_exp + 1e-10)
-        
-        # 写入 DPS 输出
-        out_tensor.copy_(res.view(1, 16, 512).to(out_tensor.dtype))
-        
-        # 写入 LSE (Logsumexp)
-        # 这是数值校验的关键：LSE = max_score + log(sum_exp)
-        if lse_tensor is not None:
-            lse = (max_score + torch.log(sum_exp)).view(1, 16)
-            lse_tensor.copy_(lse.to(lse_tensor.dtype))
+    # Flatten paged KV cache to token-level: [num_pages, page_size, dim] -> [num_pages * page_size, dim]
+    Kc_all = kv_c_pool.reshape(-1, head_dim_ckv).to(torch.float32)  # [total_kv_tokens, head_dim_ckv]
+    Kp_all = kv_r_pool.reshape(-1, head_dim_kpe).to(torch.float32)  # [total_kv_tokens, head_dim_kpe]
 
-    except Exception:
-        out_tensor.zero_()
-        if lse_tensor is not None:
-            lse_tensor.zero_()
-            
+    # Process each token
+    for t in range(num_tokens):
+        indices = kv_indices[t]  # [topk]
+
+        # Handle padding: -1 indicates invalid indices
+        valid_mask = indices != -1
+        valid_indices = indices[valid_mask].to(torch.long)
+
+        if valid_indices.numel() == 0:
+            out_tensor[t].zero_()
+            lse_tensor[t].fill_(-float('inf'))
+            continue
+
+        # Get KV entries for valid indices
+        Kc = Kc_all[valid_indices]  # [num_valid, head_dim_ckv]
+        Kp = Kp_all[valid_indices]  # [num_valid, head_dim_kpe]
+        qn = q_c[t].to(torch.float32)  # [num_qo_heads, head_dim_ckv]
+        qp = q_r[t].to(torch.float32)  # [num_qo_heads, head_dim_kpe]
+
+        # Compute attention logits: [num_qo_heads, num_valid]
+        logits = torch.matmul(qn, Kc.T) + torch.matmul(qp, Kp.T)
+        logits_scaled = logits * sm_scale
+
+        # Compute 2-base LSE: log2(exp(logits_scaled).sum())
+        lse = torch.logsumexp(logits_scaled, dim=-1) / math.log(2.0)  # [num_qo_heads]
+        lse_tensor[t] = lse.to(lse_tensor.dtype)
+
+        # Compute attention output
+        attn = torch.softmax(logits_scaled, dim=-1)  # [num_qo_heads, num_valid]
+        out = torch.matmul(attn, Kc)  # [num_qo_heads, head_dim_ckv]
+        out_tensor[t] = out.to(out_tensor.dtype)
+
     return out_tensor
