@@ -191,7 +191,7 @@ output = flashinfer_bench_run_sanitizer(
     sanitizer_types=["memcheck", "racecheck", "synccheck", "initcheck"],
     timeout=300,
 )
-print(output)
+print(output)1
 ```
 
 ### NCU Profiling
