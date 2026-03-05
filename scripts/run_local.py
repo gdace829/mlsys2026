@@ -1,11 +1,11 @@
 """
-FlashInfer-Bench Local Benchmark Runner.
-
-Automatically packs the solution from source files and runs benchmarks locally.
+FlashInfer-Bench Local Benchmark Runner (Debug Version).
+Enhanced with error tracking to capture COMPILE_ERROR details.
 """
 
 import os
 import sys
+import traceback
 from pathlib import Path
 
 # Add project root to path for imports
@@ -29,10 +29,12 @@ def get_trace_set_path() -> str:
 
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark locally and return results."""
+    # 调试阶段：减少迭代次数，确保快速反馈
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = BenchmarkConfig(warmup_runs=1, iterations=1, num_trials=1)
 
     trace_set_path = get_trace_set_path()
+    print(f"[*] Loading dataset from: {trace_set_path}")
     trace_set = TraceSet.from_path(trace_set_path)
 
     if solution.definition not in trace_set.definitions:
@@ -44,6 +46,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
+    print(f"[*] Found {len(workloads)} workloads for {solution.definition}")
+
     bench_trace_set = TraceSet(
         root=trace_set.root,
         definitions={definition.name: definition},
@@ -52,8 +56,16 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         traces={definition.name: []},
     )
 
-    benchmark = Benchmark(bench_trace_set, config)
-    result_trace_set = benchmark.run_all(dump_traces=True)
+    try:
+        benchmark = Benchmark(bench_trace_set, config)
+        # 核心：run_all 可能会抛出底层编译异常
+        result_trace_set = benchmark.run_all(dump_traces=True)
+    except Exception as e:
+        print("\n" + "!"*60)
+        print("CRITICAL ERROR CAPTURED DURING BENCHMARK RUN:")
+        traceback.print_exc()
+        print("!"*60 + "\n")
+        return {}
 
     traces = result_trace_set.traces.get(definition.name, [])
     results = {definition.name: {}}
@@ -66,11 +78,13 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             }
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
-                entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
-                entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+            
+            # 如果是 COMPILE_ERROR，尝试打印 trace 里的错误日志
+            if entry["status"] == "COMPILE_ERROR":
+                print(f"[!] Workload {trace.workload.uuid} failed with COMPILE_ERROR")
+            
             results[definition.name][trace.workload.uuid] = entry
 
     return results
@@ -78,43 +92,46 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
 def print_results(results: dict):
     """Print benchmark results in a formatted way."""
+    if not results:
+        return
+
     for def_name, traces in results.items():
-        print(f"\n{def_name}:")
+        print(f"\nResults for {def_name}:")
+        success_count = 0
         for workload_uuid, result in traces.items():
             status = result.get("status")
-            print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
-
-            if result.get("latency_ms") is not None:
-                print(f" | {result['latency_ms']:.3f} ms", end="")
-
-            if result.get("speedup_factor") is not None:
-                print(f" | {result['speedup_factor']:.2f}x speedup", end="")
-
-            if result.get("max_abs_error") is not None:
-                abs_err = result["max_abs_error"]
-                rel_err = result.get("max_rel_error", 0)
-                print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
-
-            print()
+            if status == "SUCCESS":
+                success_count += 1
+            
+            latency = result.get("latency_ms", 0)
+            print(f"  - {workload_uuid[:8]}: {status} | Latency: {latency:.4f} ms")
+        
+        print(f"\nSummary: {success_count}/{len(traces)} workloads passed.")
 
 
 def main():
     """Pack solution and run benchmark."""
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
+    try:
+        print("--- Phase 1: Packing Solution ---")
+        solution_path = pack_solution()
 
-    print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
-    print(f"Loaded: {solution.name} ({solution.definition})")
+        print("\n--- Phase 2: Loading Solution ---")
+        solution = Solution.model_validate_json(solution_path.read_text())
+        print(f"OK: {solution.name} targetting {solution.definition}")
 
-    print("\nRunning benchmark...")
-    results = run_benchmark(solution)
+        print("\n--- Phase 3: Running Benchmark ---")
+        results = run_benchmark(solution)
 
-    if not results:
-        print("No results returned!")
-        return
+        if not results:
+            print("\n[FAILED] No results returned. Check the error log above.")
+            return
 
-    print_results(results)
+        print_results(results)
+
+    except Exception as e:
+        print(f"\n[FATAL ERROR] {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
