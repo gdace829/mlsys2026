@@ -3,8 +3,10 @@
 name = "my-dsa-baseline-v1"
 
 # 核心：必须完全匹配之前 python 命令输出的那个超长字符串
-# 对应 DeepSeek Sparse Attention 赛道
-definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
+# 对应 DSA TopK Indexer 赛道（当前启用）
+definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+# 之前的 attention 配置（保留备用）
+# definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
 
 # 你的团队或个人名称
 author = "gdace829"
@@ -15,4 +17,6 @@ language = "triton"
 
 # 核心修复：路径必须相对于 solution/triton 文件夹
 # 格式为 "<文件名>::<入口函数名>"
-entry_point = "kernel.py::sparse_attention_kernel"
+entry_point = "kernel.py::topk_indexer_kernel"
+# 之前的 attention 入口（保留备用）
+# entry_point = "kernel.py::sparse_attention_kernel"

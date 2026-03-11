@@ -97,16 +97,16 @@ def print_results(results: dict):
 
     for def_name, traces in results.items():
         print(f"\nResults for {def_name}:")
-        success_count = 0
+        passed_count = 0
         for workload_uuid, result in traces.items():
             status = result.get("status")
-            if status == "SUCCESS":
-                success_count += 1
+            if status == "PASSED":
+                passed_count += 1
             
             latency = result.get("latency_ms", 0)
             print(f"  - {workload_uuid[:8]}: {status} | Latency: {latency:.4f} ms")
         
-        print(f"\nSummary: {success_count}/{len(traces)} workloads passed.")
+        print(f"\nSummary: {passed_count}/{len(traces)} workloads passed.")
 
 
 def main():
